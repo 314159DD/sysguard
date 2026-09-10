@@ -7,20 +7,16 @@ on:
     branches: [main]
 
 jobs:
-  test:
+  windows-powershell:
+    name: pester (Windows PowerShell 5.1)
     runs-on: windows-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        shell: [powershell, pwsh]
-    name: pester (${{ matrix.shell }})
     steps:
       - uses: actions/checkout@v4
       - name: Install Pester
-        shell: ${{ matrix.shell }}
+        shell: powershell
         run: Install-Module Pester -Scope CurrentUser -Force -SkipPublisherCheck -MinimumVersion 5.5.0
       - name: Run tests
-        shell: ${{ matrix.shell }}
+        shell: powershell
         run: |
           Import-Module Pester -MinimumVersion 5.5.0
           $cfg = New-PesterConfiguration
@@ -29,5 +25,26 @@ jobs:
           $cfg.Output.Verbosity = 'Detailed'
           Invoke-Pester -Configuration $cfg
       - name: Dry-run scan against the runner
-        shell: ${{ matrix.shell }}
+        shell: powershell
+        run: ./sysguard.ps1 -Scan
+
+  pwsh:
+    name: pester (PowerShell 7)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Pester
+        shell: pwsh
+        run: Install-Module Pester -Scope CurrentUser -Force -SkipPublisherCheck -MinimumVersion 5.5.0
+      - name: Run tests
+        shell: pwsh
+        run: |
+          Import-Module Pester -MinimumVersion 5.5.0
+          $cfg = New-PesterConfiguration
+          $cfg.Run.Path = 'tests'
+          $cfg.Run.Exit = $true
+          $cfg.Output.Verbosity = 'Detailed'
+          Invoke-Pester -Configuration $cfg
+      - name: Dry-run scan against the runner
+        shell: pwsh
         run: ./sysguard.ps1 -Scan

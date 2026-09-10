@@ -51,7 +51,7 @@ function Write-Log {
 # ---------------------------------------------------------------- snapshot
 function Get-ProcSnapshot {
     $snap = @{}
-    $rows = Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId, Name, CreationDate, WorkingSetSize, CommandLine
+    $rows = Get-CimInstance Win32_Process -Property ProcessId, ParentProcessId, Name, CreationDate, WorkingSetSize, CommandLine, KernelModeTime, UserModeTime
     foreach ($r in $rows) {
         $snap[[int]$r.ProcessId] = [pscustomobject]@{
             Pid     = [int]$r.ProcessId
@@ -60,6 +60,7 @@ function Get-ProcSnapshot {
             Created = $r.CreationDate
             WsKB    = [int]($r.WorkingSetSize / 1KB)
             Cmd     = $r.CommandLine
+            CpuSec  = [double](($r.KernelModeTime + $r.UserModeTime) / 10000000)
         }
     }
     return $snap

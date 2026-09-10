@@ -19,6 +19,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'rules.ps1')
+. (Join-Path $PSScriptRoot 'sessions.ps1')
 
 $script:LogFile    = Join-Path $PSScriptRoot 'sysguard.log'
 $script:ConfigFile = Join-Path $PSScriptRoot 'sysguard.config.json'
@@ -71,14 +72,17 @@ function Clear-StandbyList {
 }
 
 function Get-SysStats {
-    $os  = Get-CimInstance Win32_OperatingSystem -Property TotalVisibleMemorySize, FreePhysicalMemory
+    $os  = Get-CimInstance Win32_OperatingSystem -Property TotalVisibleMemorySize, FreePhysicalMemory, TotalVirtualMemorySize, FreeVirtualMemory
     $cpu = Get-CimInstance Win32_PerfFormattedData_PerfOS_Processor -Filter "Name='_Total'" -Property PercentProcessorTime
     $totalMB = [int]($os.TotalVisibleMemorySize / 1024)
     $freeMB  = [int]($os.FreePhysicalMemory / 1024)
     return [pscustomobject]@{
-        CpuPct  = [int]$cpu.PercentProcessorTime
-        RamUsed = $totalMB - $freeMB
-        RamTot  = $totalMB
+        CpuPct    = [int]$cpu.PercentProcessorTime
+        RamUsed   = $totalMB - $freeMB
+        RamTot    = $totalMB
+        # commit charge: RAM plus page file. Programs that cannot get memory abort here, long before RAM itself is full.
+        CommitGB  = [math]::Round(($os.TotalVirtualMemorySize - $os.FreeVirtualMemory) / 1MB, 1)
+        CommitTot = [math]::Round($os.TotalVirtualMemorySize / 1MB, 1)
     }
 }
 
@@ -109,13 +113,47 @@ if ($Uninstall) {
     exit 0
 }
 
+# ---------------------------------------------------------------- session enrichment (cached)
+$script:TitleCache  = @{}      # pid -> @{ Title; At }
+$script:HerdrCache  = @{ Map = @{}; At = [datetime]::MinValue }
+
+function Get-CachedTitle {
+    param([int]$ProcId)
+    $now = Get-Date
+    $c = $script:TitleCache[$ProcId]
+    if ($c -and ($now - $c.At).TotalSeconds -lt 15) { return $c.Title }
+    $t = Get-ProcConsoleTitle $ProcId
+    $script:TitleCache[$ProcId] = @{ Title = $t; At = $now }
+    return $t
+}
+
+function Get-EnrichedSessions {
+    param($Snap)
+    $sessions = Get-Sessions $Snap -TitleOf { param($ProcId) Get-CachedTitle $ProcId }
+    Update-SessionActivity $sessions
+    if (((Get-Date) - $script:HerdrCache.At).TotalSeconds -gt 60) {
+        $script:HerdrCache.Map = Get-HerdrSpaces (Get-HerdrExe $Snap)
+        $script:HerdrCache.At = Get-Date
+    }
+    Merge-HerdrSpaces $sessions $script:HerdrCache.Map
+    return ,$sessions
+}
+
 # ---------------------------------------------------------------- one-shot modes
 if ($Scan -or $Clean) {
     $snap = Get-ProcSnapshot
     $fam  = Get-FamilyStats $snap
     $hits = Test-ThresholdsCrossed $fam
-    Write-Host ('processes: {0}   limits crossed: {1}' -f $snap.Count, $(if ($hits) { $hits -join ', ' } else { 'none' }))
+    $sys  = Get-SysStats
+    Write-Host ('processes: {0}   limits crossed: {1}   RAM {2}/{3} MB   commit {4}/{5} GB' -f $snap.Count, $(if ($hits) { $hits -join ', ' } else { 'none' }), $sys.RamUsed, $sys.RamTot, $sys.CommitGB, $sys.CommitTot)
     [void](Invoke-AllRules $snap (-not $Clean))
+    $sessions = Get-EnrichedSessions $snap
+    Write-Host ''
+    Write-Host ('agent sessions: {0}' -f $sessions.Count)
+    if ($sessions.Count -gt 0) {
+        Write-Host ('{0,-16} {1,-40} {2,6} {3,6} {4,-10} {5,8} {6,4} {7,-30} {8}' -f 'where', 'title', 'pid', 'age', 'state', 'RAM', 'procs', 'MCPs', 'hog')
+        foreach ($s in $sessions) { Write-Host (Format-SessionRow $s) }
+    }
     exit 0
 }
 
@@ -163,7 +201,7 @@ $monoB = New-Object System.Drawing.Font('Consolas', 11, [System.Drawing.FontStyl
 
 $form = New-Object System.Windows.Forms.Form
 $form.Text = 'sysguard'
-$form.Size = New-Object System.Drawing.Size(780, 680)
+$form.Size = New-Object System.Drawing.Size(1000, 900)
 $form.MinimumSize = $form.Size
 $form.BackColor = $bg
 $form.ForeColor = $fg
@@ -174,7 +212,7 @@ $form.Location = New-Object System.Drawing.Point(40, 40)
 $lblStats = New-Object System.Windows.Forms.Label
 $lblStats.Font = $monoB
 $lblStats.Location = New-Object System.Drawing.Point(12, 10)
-$lblStats.Size = New-Object System.Drawing.Size(740, 26)
+$lblStats.Size = New-Object System.Drawing.Size(960, 26)
 $lblStats.Text = 'starting...'
 $form.Controls.Add($lblStats)
 
@@ -186,7 +224,7 @@ $lv.BackColor = $panel
 $lv.ForeColor = $fg
 $lv.Font = $mono
 $lv.Location = New-Object System.Drawing.Point(12, 42)
-$lv.Size = New-Object System.Drawing.Size(740, 230)
+$lv.Size = New-Object System.Drawing.Size(960, 230)
 $lv.Anchor = 'Top,Left,Right'
 [void]$lv.Columns.Add('process', 240)
 [void]$lv.Columns.Add('count', 80)
@@ -194,6 +232,29 @@ $lv.Anchor = 'Top,Left,Right'
 [void]$lv.Columns.Add('RAM MB', 100)
 [void]$lv.Columns.Add('status', 200)
 $form.Controls.Add($lv)
+
+# agent sessions: one row per claude.exe with its whole process tree
+$lblSess = New-Object System.Windows.Forms.Label
+$lblSess.Location = New-Object System.Drawing.Point(12, 280)
+$lblSess.Size = New-Object System.Drawing.Size(960, 20)
+$lblSess.ForeColor = $dim
+$lblSess.Text = 'agent sessions'
+$form.Controls.Add($lblSess)
+
+$lvSess = New-Object System.Windows.Forms.ListView
+$lvSess.View = 'Details'
+$lvSess.FullRowSelect = $true
+$lvSess.MultiSelect = $false
+$lvSess.HideSelection = $false
+$lvSess.GridLines = $false
+$lvSess.BackColor = $panel
+$lvSess.ForeColor = $fg
+$lvSess.Font = $mono
+$lvSess.Location = New-Object System.Drawing.Point(12, 302)
+$lvSess.Size = New-Object System.Drawing.Size(960, 170)
+$lvSess.Anchor = 'Top,Left,Right'
+foreach ($c in @(@('where', 130), @('title', 220), @('pid', 60), @('age', 55), @('state', 90), @('RAM MB', 70), @('procs', 55), @('MCPs', 130), @('hog', 150))) { [void]$lvSess.Columns.Add($c[0], $c[1]) }
+$form.Controls.Add($lvSess)
 
 function New-Btn {
     param([string]$Text, [int]$X, [int]$Y, [int]$W, [scriptblock]$OnClick)
@@ -212,26 +273,33 @@ function New-Btn {
 
 $chkDry = New-Object System.Windows.Forms.CheckBox
 $chkDry.Text = 'dry run (list only)'
-$chkDry.Location = New-Object System.Drawing.Point(12, 284)
+$chkDry.Location = New-Object System.Drawing.Point(12, 526)
 $chkDry.Size = New-Object System.Drawing.Size(220, 24)
 $form.Controls.Add($chkDry)
 
 $chkGuard = New-Object System.Windows.Forms.CheckBox
 $chkGuard.Text = 'auto-guard (kill when a limit is crossed)'
-$chkGuard.Location = New-Object System.Drawing.Point(240, 284)
+$chkGuard.Location = New-Object System.Drawing.Point(240, 526)
 $chkGuard.Size = New-Object System.Drawing.Size(360, 24)
 $form.Controls.Add($chkGuard)
 
 $chkTop = New-Object System.Windows.Forms.CheckBox
 $chkTop.Text = 'always on top'
-$chkTop.Location = New-Object System.Drawing.Point(610, 284)
+$chkTop.Location = New-Object System.Drawing.Point(610, 526)
 $chkTop.Size = New-Object System.Drawing.Size(150, 24)
 $chkTop.Checked = ($env:SYSGUARD_TOPMOST -eq '1')
 $chkTop.Add_CheckedChanged({ $form.TopMost = $chkTop.Checked })
 $form.TopMost = $chkTop.Checked
 $form.Controls.Add($chkTop)
 
-$y1 = 316; $y2 = 358
+$script:Sessions = @()
+[void](New-Btn 'end selected session' 12 482 200 {
+    if ($lvSess.SelectedItems.Count -eq 0) { Write-Log 'no session selected' 'WARN'; return }
+    $sel = $script:Sessions | Where-Object { $_.Pid -eq [int]$lvSess.SelectedItems[0].Tag }
+    if (-not $sel) { return }
+    [void](Invoke-Kill (Get-SessionKillList $sel) ('session ' + $sel.Pid) $chkDry.Checked); Update-View })
+
+$y1 = 558; $y2 = 600
 [void](New-Btn 'kill stuck shells'   12  $y1 178 { [void](Invoke-Kill (Get-StuckShells  (Get-ProcSnapshot)) 'stuck shell'    $chkDry.Checked); Update-View })
 [void](New-Btn 'kill orphan conhost' 200 $y1 178 { [void](Invoke-Kill (Get-OrphanConhost (Get-ProcSnapshot)) 'orphan conhost' $chkDry.Checked); Update-View })
 [void](New-Btn 'kill orphan cmd/node' 388 $y1 178 { [void](Invoke-Kill (Get-OrphanTrees   (Get-ProcSnapshot)) 'orphan helper'  $chkDry.Checked); Update-View })
@@ -254,8 +322,8 @@ $script:LogBox.ScrollBars = 'Vertical'
 $script:LogBox.BackColor = $panel
 $script:LogBox.ForeColor = $fg
 $script:LogBox.Font = $mono
-$script:LogBox.Location = New-Object System.Drawing.Point(12, 404)
-$script:LogBox.Size = New-Object System.Drawing.Size(740, 228)
+$script:LogBox.Location = New-Object System.Drawing.Point(12, 646)
+$script:LogBox.Size = New-Object System.Drawing.Size(960, 206)
 $script:LogBox.Anchor = 'Top,Bottom,Left,Right'
 $form.Controls.Add($script:LogBox)
 
@@ -265,7 +333,7 @@ function Update-View {
         $fam  = Get-FamilyStats $snap
         $sys  = Get-SysStats
         $adm  = if (Test-IsAdmin) { 'admin' } else { 'user' }
-        $lblStats.Text = 'CPU {0,3}%   RAM {1}/{2} MB   procs {3}   [{4}]   {5}' -f $sys.CpuPct, $sys.RamUsed, $sys.RamTot, $snap.Count, $adm, (Get-Date -Format 'HH:mm:ss')
+        $lblStats.Text = 'CPU {0,3}%   RAM {1}/{2} MB   commit {3}/{4} GB   procs {5}   [{6}]   {7}' -f $sys.CpuPct, $sys.RamUsed, $sys.RamTot, $sys.CommitGB, $sys.CommitTot, $snap.Count, $adm, (Get-Date -Format 'HH:mm:ss')
 
         $lv.BeginUpdate()
         $lv.Items.Clear()
@@ -289,6 +357,23 @@ function Update-View {
             [void]$lv.Items.Add($it)
         }
         $lv.EndUpdate()
+
+        $selected = if ($lvSess.SelectedItems.Count -gt 0) { [int]$lvSess.SelectedItems[0].Tag } else { 0 }
+        $script:Sessions = Get-EnrichedSessions $snap
+        $lvSess.BeginUpdate()
+        $lvSess.Items.Clear()
+        foreach ($s in $script:Sessions) {
+            $where = if ($s.Space) { $s.Space } else { $s.Terminal }
+            $name  = if ($s.Title) { $s.Title } elseif ($s.Cwd) { Split-Path $s.Cwd -Leaf } else { '' }
+            $state = if ($s.State -eq 'idle' -and $s.IdleMin -ne $null) { 'idle {0}m' -f $s.IdleMin } elseif ($s.State) { $s.State } else { '?' }
+            $it = New-Object System.Windows.Forms.ListViewItem($where)
+            foreach ($v in @($name, "$($s.Pid)", "$($s.AgeMin)m", $state, "$($s.RamMB)", "$($s.Procs)", ($s.Mcps -join ','), $s.Hog)) { [void]$it.SubItems.Add($v) }
+            $it.Tag = $s.Pid
+            if ($s.Hog) { $it.BackColor = $red } elseif ($s.State -eq 'idle') { $it.ForeColor = $dim }
+            if ($s.Pid -eq $selected) { $it.Selected = $true }
+            [void]$lvSess.Items.Add($it)
+        }
+        $lvSess.EndUpdate()
         if ($env:SYSGUARD_SNAPSHOT) {
             # render the form to a PNG (works even when another window covers it)
             $bmp = New-Object System.Drawing.Bitmap($form.Width, $form.Height)

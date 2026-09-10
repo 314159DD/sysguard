@@ -1,0 +1,11 @@
+{
+  "thresholds": {
+    "powershell": 40,
+    "pwsh": 40,
+    "conhost": 60,
+    "node": 30,
+    "cmd": 30
+  },
+  "stuckShellMaxAgeSec": 30,
+  "stuckShellMaxWsKB": 2048
+}

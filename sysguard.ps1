@@ -226,12 +226,20 @@ $lv.Font = $mono
 $lv.Location = New-Object System.Drawing.Point(12, 42)
 $lv.Size = New-Object System.Drawing.Size(960, 230)
 $lv.Anchor = 'Top,Left,Right'
-[void]$lv.Columns.Add('process', 240)
-[void]$lv.Columns.Add('count', 80)
-[void]$lv.Columns.Add('limit', 80)
-[void]$lv.Columns.Add('RAM MB', 100)
+[void]$lv.Columns.Add('process', 300)
+[void]$lv.Columns.Add('count', 100)
+[void]$lv.Columns.Add('limit', 100)
+[void]$lv.Columns.Add('RAM MB', 120)
 [void]$lv.Columns.Add('status', 200)
 $form.Controls.Add($lv)
+
+function Set-FillColumn {
+    # last column takes whatever width is left, measured after the vertical scrollbar has appeared
+    param($List)
+    $w = $List.ClientSize.Width
+    for ($i = 0; $i -lt $List.Columns.Count - 1; $i++) { $w -= $List.Columns[$i].Width }
+    $List.Columns[$List.Columns.Count - 1].Width = [math]::Max($w - 2, 80)
+}
 
 # agent sessions: one row per claude.exe with its whole process tree
 $lblSess = New-Object System.Windows.Forms.Label
@@ -255,6 +263,7 @@ $lvSess.Size = New-Object System.Drawing.Size(960, 170)
 $lvSess.Anchor = 'Top,Left,Right'
 foreach ($c in @(@('where', 130), @('title', 220), @('pid', 60), @('age', 55), @('state', 90), @('RAM MB', 70), @('procs', 55), @('MCPs', 130), @('hog', 150))) { [void]$lvSess.Columns.Add($c[0], $c[1]) }
 $form.Controls.Add($lvSess)
+$form.Add_Resize({ Set-FillColumn $lv; Set-FillColumn $lvSess })
 
 function New-Btn {
     param([string]$Text, [int]$X, [int]$Y, [int]$W, [scriptblock]$OnClick)
@@ -285,7 +294,7 @@ $form.Controls.Add($chkGuard)
 
 $chkTop = New-Object System.Windows.Forms.CheckBox
 $chkTop.Text = 'always on top'
-$chkTop.Location = New-Object System.Drawing.Point(610, 526)
+$chkTop.Location = New-Object System.Drawing.Point(744, 526)
 $chkTop.Size = New-Object System.Drawing.Size(150, 24)
 $chkTop.Checked = ($env:SYSGUARD_TOPMOST -eq '1')
 $chkTop.Add_CheckedChanged({ $form.TopMost = $chkTop.Checked })
@@ -300,17 +309,17 @@ $script:Sessions = @()
     [void](Invoke-Kill (Get-SessionKillList $sel) ('session ' + $sel.Pid) $chkDry.Checked); Update-View })
 
 $y1 = 558; $y2 = 600
-[void](New-Btn 'kill stuck shells'   12  $y1 178 { [void](Invoke-Kill (Get-StuckShells  (Get-ProcSnapshot)) 'stuck shell'    $chkDry.Checked); Update-View })
-[void](New-Btn 'kill orphan conhost' 200 $y1 178 { [void](Invoke-Kill (Get-OrphanConhost (Get-ProcSnapshot)) 'orphan conhost' $chkDry.Checked); Update-View })
-[void](New-Btn 'kill orphan cmd/node' 388 $y1 178 { [void](Invoke-Kill (Get-OrphanTrees   (Get-ProcSnapshot)) 'orphan helper'  $chkDry.Checked); Update-View })
-[void](New-Btn 'ALL three'           576 $y1 176 { [void](Invoke-AllRules (Get-ProcSnapshot) $chkDry.Checked); Update-View })
-[void](New-Btn 'flush standby RAM'   12  $y2 178 { Clear-StandbyList; Update-View })
-[void](New-Btn 'nuke ALL powershell (except me)' 200 $y2 366 {
+[void](New-Btn 'kill stuck shells'   12  $y1 228 { [void](Invoke-Kill (Get-StuckShells  (Get-ProcSnapshot)) 'stuck shell'    $chkDry.Checked); Update-View })
+[void](New-Btn 'kill orphan conhost' 256 $y1 228 { [void](Invoke-Kill (Get-OrphanConhost (Get-ProcSnapshot)) 'orphan conhost' $chkDry.Checked); Update-View })
+[void](New-Btn 'kill orphan cmd/node' 500 $y1 228 { [void](Invoke-Kill (Get-OrphanTrees   (Get-ProcSnapshot)) 'orphan helper'  $chkDry.Checked); Update-View })
+[void](New-Btn 'ALL three'           744 $y1 228 { [void](Invoke-AllRules (Get-ProcSnapshot) $chkDry.Checked); Update-View })
+[void](New-Btn 'flush standby RAM'   12  $y2 228 { Clear-StandbyList; Update-View })
+[void](New-Btn 'nuke ALL powershell (except me)' 256 $y2 472 {
     $snap = Get-ProcSnapshot
     $all = @($snap.Values | Where-Object { $script:ShellNames -contains $_.Name -and $_.Pid -ne $script:SelfPid })
     [void](Invoke-Kill $all 'powershell (nuke)' $chkDry.Checked); Update-View })
 if (-not (Test-IsAdmin)) {
-    [void](New-Btn 'relaunch as admin' 576 $y2 176 {
+    [void](New-Btn 'relaunch as admin' 744 $y2 228 {
         Start-Process powershell.exe -Verb RunAs -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA', '-WindowStyle', 'Hidden', '-File', "`"$PSCommandPath`"")
         $form.Close() })
 }
@@ -357,6 +366,7 @@ function Update-View {
             [void]$lv.Items.Add($it)
         }
         $lv.EndUpdate()
+        Set-FillColumn $lv
 
         $selected = if ($lvSess.SelectedItems.Count -gt 0) { [int]$lvSess.SelectedItems[0].Tag } else { 0 }
         $script:Sessions = Get-EnrichedSessions $snap
@@ -374,6 +384,7 @@ function Update-View {
             [void]$lvSess.Items.Add($it)
         }
         $lvSess.EndUpdate()
+        Set-FillColumn $lvSess
         if ($env:SYSGUARD_SNAPSHOT) {
             # render the form to a PNG (works even when another window covers it)
             $bmp = New-Object System.Drawing.Bitmap($form.Width, $form.Height)

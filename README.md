@@ -36,6 +36,38 @@ sysguard never kills itself, and every kill goes to `sysguard.log` with name, PI
 
 Two extra buttons exist for emergencies: **nuke all powershell** (everything except sysguard) and **flush standby RAM** (purges the Windows standby list via `NtSetSystemInformation`, needs admin).
 
+## Hygiene rules and system alerts
+
+Some of the worst slowdowns never cross a process-count limit. One afternoon on a 96 GB machine the mouse stopped moving: 16 hung `grep`/`tail` processes kept a hard disk at 100 %, 25 throwaway PostgreSQL clusters from test-gate runs had never been stopped (5.7 GB RAM), and a vendor telemetry process had leaked 1.08 million handles, which grew the kernel pools to 19 GB. So the guard also runs these on every tick, limit or not:
+
+| Rule | Target | Action |
+|---|---|---|
+| stale tools | `grep`, `find`, `tail`, `xargs`, `rg` older than 10 min | killed. Agents run them for seconds; an old one is the leftover of a killed shell |
+| stale pg lanes | a postmaster whose data dir lies under one of `pgLaneRoots` and that is older than 120 min | `pg_ctl stop -m fast` (data stays on disk). Clusters outside the configured roots are never touched, and with no roots configured the rule is off |
+
+And it raises an alert (log line plus a popup, at most once per 30 min for the same alert; red in the GUI stats line) when
+
+- a single process holds more than 100,000 handles, which is how a handle leak looks long before it hurts,
+- the kernel pools (paged plus nonpaged) exceed 4 GB, normal is under 2 GB and only a reboot gives leaked pool back,
+- the commit charge passes 90 %.
+
+## CPU cap for agent sessions
+
+`cpucap.ps1` puts the calling PowerShell into a shared Windows job object (`Local\sysguard-agents`) with a hard CPU cap and below-normal priority. Everything that shell starts afterwards inherits both, so an agent that fans out a full test suite, a type check and a build can take at most the capped share of the machine, and the desktop stays responsive. Priority alone costs nothing while the machine is idle; the hard cap only bites when agents would otherwise take every core.
+
+Wrap your agent command in the PowerShell profile:
+
+```powershell
+function claude {
+    . 'C:\path	o\sysguard\cpucap.ps1'
+    Enter-CpuCap -Percent 80
+    $exe = Get-Command claude -CommandType Application | Select-Object -First 1
+    & $exe.Source @args
+}
+```
+
+All sessions share the one job, so the cap applies to all of them together. Set `$env:SYSGUARD_CPUCAP = 'off'` to skip it in a shell.
+
 ## Agent sessions
 
 Every `claude.exe` on the machine is shown as one session: the agent process plus everything under it (MCP servers, tool shells, whatever they spawned).
@@ -57,7 +89,7 @@ The stats line also shows the **commit charge** (RAM plus page file). Programs t
 
 ```
 sysguard.bat                   GUI monitor: live families vs limits, agent sessions, kill buttons, dry-run toggle, auto-guard
-sysguard-guard.bat             headless guard: 10 s loop, applies the rules only while a limit is crossed
+sysguard-guard.bat             headless guard: 10 s loop, applies the kill rules while a limit is crossed and the hygiene rules and alerts always
 powershell -File sysguard.ps1 -Scan       print what the rules WOULD kill right now and the session table, exit
 powershell -File sysguard.ps1 -Clean      apply the rules once, exit
 powershell -File sysguard.ps1 -Install    register the headless guard as a logon task
@@ -79,7 +111,7 @@ The guard and the auto-guard checkbox only act while a family is over its limit;
 | node | 30 |
 | cmd | 30 |
 
-Override any of these, or the stuck-shell thresholds, in a `sysguard.config.json` next to the script. Only the keys you set are changed; `sysguard.config.example.json` lists them all.
+Override any of these, the stuck-shell thresholds, or the hygiene and alert values (`staleToolMaxAgeMin`, `staleToolNames`, `pgLaneRoots`, `pgLaneMaxAgeMin`, `handleAlertCount`, `poolAlertGB`, `commitAlertPct`) in a `sysguard.config.json` next to the script. Only the keys you set are changed; `sysguard.config.example.json` lists them all.
 
 ```json
 { "thresholds": { "node": 50, "chrome": 80 }, "stuckShellMaxAgeSec": 45 }
@@ -100,7 +132,7 @@ Install-Module Pester -Scope CurrentUser -MinimumVersion 5.5.0
 Invoke-Pester tests
 ```
 
-51 tests run the rule engine and the session model against synthetic process tables: dead chains, protected wrappers, PID reuse, threshold edges, dry-run vs real kills (with `Stop-Process` mocked), config overrides, terminal attribution, MCP name parsing, title glyphs, idle detection over several ticks, hog flags, and kill order. CI runs them on `windows-latest` under both Windows PowerShell 5.1 and PowerShell 7, then does a `-Scan` dry run against the runner itself.
+77 tests run the rule engine, the hygiene rules, the alerts and the session model against synthetic process tables, plus the CPU cap in child shells: dead chains, protected wrappers, PID reuse, threshold edges, dry-run vs real kills (with `Stop-Process` mocked), config overrides, terminal attribution, MCP name parsing, title glyphs, idle detection over several ticks, hog flags, and kill order. CI runs them on `windows-latest` under both Windows PowerShell 5.1 and PowerShell 7, then does a `-Scan` dry run against the runner itself.
 
 ## Project structure
 
@@ -108,6 +140,7 @@ Invoke-Pester tests
 sysguard.ps1                  Entry point: modes, logon task, standby flush (P/Invoke), WinForms GUI
 rules.ps1                     Rule engine: snapshot, orphan-tree resolution, stuck-shell rule, family stats, config
 sessions.ps1                  Session model: agent trees, terminal and herdr attribution, cwd and console title (P/Invoke), idle detection, hogs
+cpucap.ps1                    CPU cap: shared job object with hard CPU limit and below-normal priority for agent shells
 sysguard.bat                  Launch the GUI (hidden console, STA)
 sysguard-guard.bat            Launch the headless guard
 sysguard.config.example.json  Every overridable limit with its default

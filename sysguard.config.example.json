@@ -7,5 +7,12 @@
     "cmd": 30
   },
   "stuckShellMaxAgeSec": 30,
-  "stuckShellMaxWsKB": 2048
+  "stuckShellMaxWsKB": 2048,
+  "staleToolMaxAgeMin": 10,
+  "staleToolNames": ["grep.exe", "find.exe", "tail.exe", "xargs.exe", "rg.exe"],
+  "pgLaneRoots": ["C:/dev/.pg"],
+  "pgLaneMaxAgeMin": 120,
+  "handleAlertCount": 100000,
+  "poolAlertGB": 4,
+  "commitAlertPct": 90
 }

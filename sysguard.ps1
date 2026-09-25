@@ -147,6 +147,8 @@ if ($Scan -or $Clean) {
     $sys  = Get-SysStats
     Write-Host ('processes: {0}   limits crossed: {1}   RAM {2}/{3} MB   commit {4}/{5} GB' -f $snap.Count, $(if ($hits) { $hits -join ', ' } else { 'none' }), $sys.RamUsed, $sys.RamTot, $sys.CommitGB, $sys.CommitTot)
     [void](Invoke-AllRules $snap (-not $Clean))
+    [void](Invoke-Hygiene $snap (-not $Clean))
+    foreach ($a in (Get-SystemAlerts)) { Write-Log $a 'ALERT' }
     $sessions = Get-EnrichedSessions $snap
     Write-Host ''
     Write-Host ('agent sessions: {0}' -f $sessions.Count)
@@ -165,6 +167,8 @@ if ($Guard) {
         exit 0
     }
     Write-Log ('guard started, interval {0}s, pid {1}' -f $Interval, $PID)
+    $script:LastAlertCheck = [datetime]::MinValue
+    $script:AlertSeen = @{}
     while ($true) {
         try {
             $snap = Get-ProcSnapshot
@@ -172,6 +176,21 @@ if ($Guard) {
             if ($hits) {
                 Write-Log ('limit crossed: ' + ($hits -join ', ')) 'ALERT'
                 [void](Invoke-AllRules $snap $false)
+            }
+            # Hygiene laeuft immer (2026-09-25): alte Such-Tools, alte Postgres-Lanes.
+            $h = Invoke-Hygiene $snap $false
+            # Systemalarme hoechstens alle 30 min je Text, als Log + Popup.
+            if (((Get-Date) - $script:LastAlertCheck).TotalSeconds -ge 60) {
+                $script:LastAlertCheck = Get-Date
+                foreach ($a in (Get-SystemAlerts)) {
+                    $key = Get-AlertKey $a
+                    if (-not $script:AlertSeen[$key] -or ((Get-Date) - $script:AlertSeen[$key]).TotalMinutes -ge 30) {
+                        $script:AlertSeen[$key] = Get-Date
+                        Write-Log $a 'ALERT'
+                        $msg = ('sysguard: ' + $a).Replace("'", ' ')
+                        Start-Process mshta -ArgumentList ("javascript:alert('" + $msg + "');close()") -WindowStyle Hidden
+                    }
+                }
             }
         } catch { Write-Log $_.Exception.Message 'WARN' }
         Start-Sleep -Seconds $Interval
@@ -287,7 +306,7 @@ $chkDry.Size = New-Object System.Drawing.Size(220, 24)
 $form.Controls.Add($chkDry)
 
 $chkGuard = New-Object System.Windows.Forms.CheckBox
-$chkGuard.Text = 'auto-guard (kill when a limit is crossed)'
+$chkGuard.Text = 'auto-guard (limits + stale tools/pg lanes)'
 $chkGuard.Location = New-Object System.Drawing.Point(240, 526)
 $chkGuard.Size = New-Object System.Drawing.Size(360, 24)
 $form.Controls.Add($chkGuard)
@@ -302,6 +321,7 @@ $form.TopMost = $chkTop.Checked
 $form.Controls.Add($chkTop)
 
 $script:Sessions = @()
+$script:Alerts = @(); $script:AlertsAt = [datetime]::MinValue
 [void](New-Btn 'end selected session' 12 482 200 {
     if ($lvSess.SelectedItems.Count -eq 0) { Write-Log 'no session selected' 'WARN'; return }
     $sel = $script:Sessions | Where-Object { $_.Pid -eq [int]$lvSess.SelectedItems[0].Tag }
@@ -314,7 +334,8 @@ $y1 = 558; $y2 = 600
 [void](New-Btn 'kill orphan cmd/node' 500 $y1 228 { [void](Invoke-Kill (Get-OrphanTrees   (Get-ProcSnapshot)) 'orphan helper'  $chkDry.Checked); Update-View })
 [void](New-Btn 'ALL three'           744 $y1 228 { [void](Invoke-AllRules (Get-ProcSnapshot) $chkDry.Checked); Update-View })
 [void](New-Btn 'flush standby RAM'   12  $y2 228 { Clear-StandbyList; Update-View })
-[void](New-Btn 'nuke ALL powershell (except me)' 256 $y2 472 {
+[void](New-Btn 'stale tools + pg lanes' 500 $y2 228 { [void](Invoke-Hygiene (Get-ProcSnapshot) $chkDry.Checked); Update-View })
+[void](New-Btn 'nuke ALL powershell (except me)' 256 $y2 228 {
     $snap = Get-ProcSnapshot
     $all = @($snap.Values | Where-Object { $script:ShellNames -contains $_.Name -and $_.Pid -ne $script:SelfPid })
     [void](Invoke-Kill $all 'powershell (nuke)' $chkDry.Checked); Update-View })
@@ -343,6 +364,12 @@ function Update-View {
         $sys  = Get-SysStats
         $adm  = if (Test-IsAdmin) { 'admin' } else { 'user' }
         $lblStats.Text = 'CPU {0,3}%   RAM {1}/{2} MB   commit {3}/{4} GB   procs {5}   [{6}]   {7}' -f $sys.CpuPct, $sys.RamUsed, $sys.RamTot, $sys.CommitGB, $sys.CommitTot, $snap.Count, $adm, (Get-Date -Format 'HH:mm:ss')
+        # system alerts (handle leak, kernel pool, commit) at most once a minute, shown red in the stats line
+        if (((Get-Date) - $script:AlertsAt).TotalSeconds -ge 60) { $script:Alerts = @(Get-SystemAlerts); $script:AlertsAt = Get-Date }
+        if ($script:Alerts.Count -gt 0) {
+            $lblStats.Text += '   ALERT: ' + ($script:Alerts -join ' | ')
+            $lblStats.ForeColor = [System.Drawing.Color]::FromArgb(255, 120, 120)
+        } else { $lblStats.ForeColor = $fg }
 
         $lv.BeginUpdate()
         $lv.Items.Clear()
@@ -398,6 +425,7 @@ function Update-View {
                 Write-Log ('auto-guard: ' + ($hits -join ', ')) 'ALERT'
                 [void](Invoke-AllRules $snap $chkDry.Checked)
             }
+            [void](Invoke-Hygiene $snap $chkDry.Checked)
         }
     } catch {
         Write-Log $_.Exception.Message 'WARN'

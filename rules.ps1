@@ -26,6 +26,7 @@ function Import-SysguardConfig {
     $cfg = Get-Content -Path $Path -Raw | ConvertFrom-Json
     if ($cfg.stuckShellMaxAgeSec) { $script:StuckShellMaxAgeSec = [int]$cfg.stuckShellMaxAgeSec }
     if ($cfg.stuckShellMaxWsKB)   { $script:StuckShellMaxWsKB   = [int]$cfg.stuckShellMaxWsKB }
+    Import-HygieneConfig $cfg
     if ($cfg.thresholds) {
         foreach ($prop in $cfg.thresholds.PSObject.Properties) {
             $script:Thresholds[$prop.Name] = [int]$prop.Value
@@ -188,4 +189,145 @@ function Test-ThresholdsCrossed {
         }
     }
     return $hits
+}
+
+# ---------------------------------------------------------------- hygiene rules
+# These run on every guard tick, not only when a family limit is crossed. They exist because of
+# one afternoon (2026-09-25) on a 96 GB machine where the mouse stopped moving: 16 hung grep/tail
+# processes kept a hard disk at 100 %, 25 throwaway postgres clusters from test-gate runs were
+# never stopped (5.7 GB RAM), and a vendor telemetry process had leaked 1.08 million handles,
+# which grew the kernel pools to 19 GB. None of that crosses a process-count limit.
+$script:StaleToolNames     = @('grep.exe', 'find.exe', 'tail.exe', 'xargs.exe', 'rg.exe')
+$script:StaleToolMaxAgeMin = 10
+$script:PgLaneRoots        = @()        # data-dir prefixes of throwaway postgres clusters, from config
+$script:PgLaneMaxAgeMin    = 120
+$script:HandleAlertCount   = 100000
+$script:PoolAlertGB        = 4
+$script:CommitAlertPct     = 90
+
+function Import-HygieneConfig {
+    # Reads the hygiene keys from an already parsed config object. Called by Import-SysguardConfig.
+    param($Cfg)
+    if ($Cfg.staleToolMaxAgeMin) { $script:StaleToolMaxAgeMin = [int]$Cfg.staleToolMaxAgeMin }
+    if ($Cfg.staleToolNames)     { $script:StaleToolNames     = @($Cfg.staleToolNames | ForEach-Object { $_.ToLower() }) }
+    if ($Cfg.pgLaneRoots)        { $script:PgLaneRoots        = @($Cfg.pgLaneRoots) }
+    if ($Cfg.pgLaneMaxAgeMin)    { $script:PgLaneMaxAgeMin    = [int]$Cfg.pgLaneMaxAgeMin }
+    if ($Cfg.handleAlertCount)   { $script:HandleAlertCount   = [int]$Cfg.handleAlertCount }
+    if ($Cfg.poolAlertGB)        { $script:PoolAlertGB        = [double]$Cfg.poolAlertGB }
+    if ($Cfg.commitAlertPct)     { $script:CommitAlertPct     = [double]$Cfg.commitAlertPct }
+}
+
+function Get-AgeMin {
+    param($P, [datetime]$Now = (Get-Date))
+    if (-not $P.Created) { return 0 }
+    return ($Now - $P.Created).TotalMinutes
+}
+
+function Get-StaleTools {
+    # Search/tail tools older than StaleToolMaxAgeMin. Agents run them for seconds; an old one is
+    # the leftover of a killed shell and keeps a disk busy.
+    param($Snap, [datetime]$Now = (Get-Date))
+    return @($Snap.Values | Where-Object {
+        $_.Pid -ne $script:SelfPid -and
+        $script:StaleToolNames -contains $_.Name.ToLower() -and
+        (Get-AgeMin $_ $Now) -gt $script:StaleToolMaxAgeMin
+    })
+}
+
+function Get-PgDataDir {
+    # Data directory from a postgres command line (-D "dir" or -D dir), or $null.
+    param([string]$Cmd)
+    if (-not $Cmd) { return $null }
+    if ($Cmd -match '-D\s+"([^"]+)"') { return $matches[1] }
+    if ($Cmd -match '-D\s+(\S+)') { return $matches[1] }
+    return $null
+}
+
+function Get-StalePgLanes {
+    # Postmasters (postgres whose parent is not postgres) with a data dir under one of PgLaneRoots
+    # and older than PgLaneMaxAgeMin. Returns objects with Proc, DataDir, PgCtl.
+    param($Snap, [datetime]$Now = (Get-Date))
+    $out = @()
+    if (@($script:PgLaneRoots).Count -eq 0) { return $out }
+    foreach ($p in $Snap.Values) {
+        if ($p.Name -ne 'postgres.exe') { continue }
+        $parent = $Snap[$p.Ppid]
+        if ($parent -and $parent.Name -eq 'postgres.exe') { continue }
+        $dir = Get-PgDataDir $p.Cmd
+        if (-not $dir) { continue }
+        $norm = $dir.Replace('\', '/').ToLower()
+        $inRoot = $false
+        foreach ($r in $script:PgLaneRoots) {
+            if ($norm.StartsWith($r.Replace('\', '/').ToLower())) { $inRoot = $true }
+        }
+        if (-not $inRoot) { continue }
+        if ((Get-AgeMin $p $Now) -le $script:PgLaneMaxAgeMin) { continue }
+        $exe = if ($p.Cmd -match '^"([^"]+)"') { $matches[1] } else { ($p.Cmd -split '\s+')[0] }
+        $out += [pscustomobject]@{ Proc = $p; DataDir = $dir; PgCtl = (Join-Path (Split-Path $exe) 'pg_ctl.exe') }
+    }
+    return $out
+}
+
+function Invoke-StopPgLanes {
+    # Stops each lane with "pg_ctl stop -m fast" (data stays on disk). Falls back to killing the
+    # postmaster when pg_ctl is not next to postgres.exe.
+    param($Lanes, [bool]$DryRun, [datetime]$Now = (Get-Date))
+    $n = 0
+    foreach ($l in @($Lanes)) {
+        if (-not $l) { continue }
+        $verb = if ($DryRun) { 'WOULD STOP' } else { 'STOP' }
+        Write-Log ('{0} stale pg lane: {1} (pid={2}, {3:N0} min)' -f $verb, $l.DataDir, $l.Proc.Pid, (Get-AgeMin $l.Proc $Now))
+        if ($DryRun) { continue }
+        try {
+            if (Test-Path $l.PgCtl) { & $l.PgCtl stop -D $l.DataDir -m fast -w -t 30 2>&1 | Out-Null }
+            else { Stop-Process -Id $l.Proc.Pid -Force -ErrorAction Stop }
+            $n++
+        } catch { Write-Log ('pg lane stop failed {0}: {1}' -f $l.DataDir, $_.Exception.Message) 'WARN' }
+    }
+    return $n
+}
+
+function Invoke-Hygiene {
+    param($Snap, [bool]$DryRun, [datetime]$Now = (Get-Date))
+    # Runs every tick, so it only logs when it actually finds something.
+    $n = 0
+    $tools = @(Get-StaleTools $Snap $Now)
+    if ($tools.Count -gt 0) { $n += Invoke-Kill $tools 'stale tool' $DryRun }
+    $lanes = @(Get-StalePgLanes $Snap $Now)
+    if ($lanes.Count -gt 0) { $n += Invoke-StopPgLanes $lanes $DryRun $Now }
+    return $n
+}
+
+# ---------------------------------------------------------------- system alerts
+function Get-AlertsFrom {
+    # Pure: turns measured values into alert texts. HandleRows = objects with Name, Id, HandleCount.
+    param($HandleRows, [double]$PoolGB, [double]$CommitPct)
+    $alerts = @()
+    foreach ($h in @($HandleRows)) {
+        if ($h -and $h.HandleCount -gt $script:HandleAlertCount) {
+            $alerts += ('{0} (pid {1}) holds {2:N0} handles, probably a leak' -f $h.Name, $h.Id, $h.HandleCount)
+        }
+    }
+    if ($PoolGB -gt $script:PoolAlertGB) { $alerts += ('kernel pool {0:N1} GB (normal is under 2 GB), plan a reboot' -f $PoolGB) }
+    if ($CommitPct -gt $script:CommitAlertPct) { $alerts += ('commit charge at {0:N0} %' -f $CommitPct) }
+    return $alerts
+}
+
+function Get-SystemAlerts {
+    # Reads the live values and hands them to Get-AlertsFrom.
+    $handles = Get-Process -ErrorAction SilentlyContinue | Select-Object Name, Id, HandleCount
+    $pool = 0; $commit = 0
+    try {
+        $c = (Get-Counter '\Memory\Pool Nonpaged Bytes', '\Memory\Pool Paged Bytes', '\Memory\% Committed Bytes In Use' -ErrorAction Stop).CounterSamples
+        $pool = ($c[0].CookedValue + $c[1].CookedValue) / 1GB
+        $commit = $c[2].CookedValue
+    } catch {}
+    return Get-AlertsFrom $handles $pool $commit
+}
+
+function Get-AlertKey {
+    # Alert text without its numbers, so "holds 101,000 handles" and "holds 140,000 handles"
+    # count as the same alert for the cooldown.
+    param([string]$Alert)
+    return ($Alert -replace '[\d.,]+', '#')
 }

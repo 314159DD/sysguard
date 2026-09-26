@@ -45,7 +45,7 @@ Some of the worst slowdowns never cross a process-count limit. One afternoon on 
 | stale tools | `grep`, `find`, `tail`, `xargs`, `rg` older than 10 min | killed. Agents run them for seconds; an old one is the leftover of a killed shell |
 | stale pg lanes | a postmaster whose data dir lies under one of `pgLaneRoots` and that is older than 120 min | `pg_ctl stop -m fast` (data stays on disk). Clusters outside the configured roots are never touched, and with no roots configured the rule is off |
 
-And it raises an alert (log line plus a popup, at most once per 30 min for the same alert; red in the GUI stats line) when
+And it raises an alert when the conditions below hold. Alerts never open a window or steal focus (a popup that pulls you out of a fullscreen game is worse than the problem): the guard writes a log line at most once per 30 min per alert, turns its tray dot orange with the alert as tooltip, and the GUI shows a red warning bar under the stats line
 
 - a single process holds more than 100,000 handles, which is how a handle leak looks long before it hurts,
 - the kernel pools (paged plus nonpaged) exceed 4 GB, normal is under 2 GB and only a reboot gives leaked pool back,
@@ -89,7 +89,7 @@ The stats line also shows the **commit charge** (RAM plus page file). Programs t
 
 ```
 sysguard.bat                   GUI monitor: live families vs limits, agent sessions, kill buttons, dry-run toggle, auto-guard
-sysguard-guard.bat             headless guard: 10 s loop, applies the kill rules while a limit is crossed and the hygiene rules and alerts always
+sysguard-guard.bat             guard with a tray icon (green ok, orange alert; right-click: open GUI, open log, stop): 10 s loop, applies the kill rules while a limit is crossed and the hygiene rules and alerts always
 powershell -File sysguard.ps1 -Scan       print what the rules WOULD kill right now and the session table, exit
 powershell -File sysguard.ps1 -Clean      apply the rules once, exit
 powershell -File sysguard.ps1 -Install    register the headless guard as a logon task

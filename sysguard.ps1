@@ -1,4 +1,4 @@
-# sysguard - process-storm guard and system monitor for Windows
+﻿# sysguard - process-storm guard and system monitor for Windows
 # Plain PowerShell 5.1 + WinForms. No dependencies.
 #
 #   sysguard.ps1              GUI monitor with kill buttons
@@ -169,7 +169,35 @@ if ($Guard) {
     Write-Log ('guard started, interval {0}s, pid {1}' -f $Interval, $PID)
     $script:LastAlertCheck = [datetime]::MinValue
     $script:AlertSeen = @{}
-    while ($true) {
+    # Tray statt unsichtbarer Schleife (Steven 26.09.): Symbol zeigt den Zustand, nie ein Popup oder eine Sprechblase.
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+    $script:ActiveAlerts = @()
+    function New-DotIcon([System.Drawing.Color]$c) {
+        $bmp = New-Object System.Drawing.Bitmap 16, 16
+        $g = [System.Drawing.Graphics]::FromImage($bmp)
+        $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+        $g.FillEllipse((New-Object System.Drawing.SolidBrush $c), 2, 2, 12, 12)
+        $g.DrawEllipse((New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(200, 20, 20, 20)), 1), 2, 2, 12, 12)
+        $g.Dispose()
+        return [System.Drawing.Icon]::FromHandle($bmp.GetHicon())
+    }
+    $script:IconOk    = New-DotIcon ([System.Drawing.Color]::FromArgb(70, 190, 110))
+    $script:IconAlert = New-DotIcon ([System.Drawing.Color]::FromArgb(240, 150, 40))
+    $tray = New-Object System.Windows.Forms.NotifyIcon
+    $tray.Icon = $script:IconOk
+    $tray.Text = 'sysguard: laeuft'
+    $menu = New-Object System.Windows.Forms.ContextMenuStrip
+    $openGui = { Start-Process powershell -ArgumentList ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}"' -f $PSCommandPath) }
+    [void]$menu.Items.Add('sysguard oeffnen', $null, $openGui)
+    [void]$menu.Items.Add('Log oeffnen', $null, { Start-Process notepad.exe -ArgumentList ('"{0}"' -f $script:LogFile) })
+    [void]$menu.Items.Add('-')
+    [void]$menu.Items.Add('Waechter beenden', $null, { Write-Log 'guard stopped from tray'; $tray.Visible = $false; $tray.Dispose(); [System.Windows.Forms.Application]::Exit() })
+    $tray.ContextMenuStrip = $menu
+    $tray.add_DoubleClick($openGui)
+    $tray.Visible = $true
+
+    $tick = {
         try {
             $snap = Get-ProcSnapshot
             $hits = Test-ThresholdsCrossed (Get-FamilyStats $snap)
@@ -179,22 +207,37 @@ if ($Guard) {
             }
             # Hygiene laeuft immer (2026-09-25): alte Such-Tools, alte Postgres-Lanes.
             $h = Invoke-Hygiene $snap $false
-            # Systemalarme hoechstens alle 30 min je Text, als Log + Popup.
+            # Systemalarme hoechstens alle 30 min je Text, nur ins Log und ins Tray-Symbol (kein Popup: Steven 26.09., reisst aus Spielen raus).
             if (((Get-Date) - $script:LastAlertCheck).TotalSeconds -ge 60) {
                 $script:LastAlertCheck = Get-Date
-                foreach ($a in (Get-SystemAlerts)) {
+                $script:ActiveAlerts = @(Get-SystemAlerts)
+                foreach ($a in $script:ActiveAlerts) {
                     $key = Get-AlertKey $a
                     if (-not $script:AlertSeen[$key] -or ((Get-Date) - $script:AlertSeen[$key]).TotalMinutes -ge 30) {
                         $script:AlertSeen[$key] = Get-Date
                         Write-Log $a 'ALERT'
-                        $msg = ('sysguard: ' + $a).Replace("'", ' ')
-                        Start-Process mshta -ArgumentList ("javascript:alert('" + $msg + "');close()") -WindowStyle Hidden
                     }
                 }
+                if ($script:ActiveAlerts.Count -gt 0) {
+                    $tray.Icon = $script:IconAlert
+                    $t = 'sysguard: ' + $script:ActiveAlerts[0]
+                } else {
+                    $tray.Icon = $script:IconOk
+                    $t = 'sysguard: alles ok'
+                }
+                # NotifyIcon.Text erlaubt hoechstens 63 Zeichen
+                $tray.Text = if ($t.Length -gt 63) { $t.Substring(0, 60) + '...' } else { $t }
             }
         } catch { Write-Log $_.Exception.Message 'WARN' }
-        Start-Sleep -Seconds $Interval
     }
+    $timer = New-Object System.Windows.Forms.Timer
+    $timer.Interval = [Math]::Max(1, $Interval) * 1000
+    $timer.add_Tick($tick)
+    $timer.Start()
+    & $tick
+    [System.Windows.Forms.Application]::Run()
+    $timer.Stop()
+    exit 0
 }
 
 # ---------------------------------------------------------------- GUI
@@ -233,7 +276,24 @@ $lblStats.Font = $monoB
 $lblStats.Location = New-Object System.Drawing.Point(12, 10)
 $lblStats.Size = New-Object System.Drawing.Size(960, 26)
 $lblStats.Text = 'starting...'
+$lblStats.AutoEllipsis = $true
+$lblStats.Anchor = 'Top,Left,Right'
 $form.Controls.Add($lblStats)
+
+# Warnband unter der Statuszeile (26.09.): eigene Zeile statt roter Anhang, der abgeschnitten wurde.
+$lblAlert = New-Object System.Windows.Forms.Label
+$lblAlert.Font = $monoB
+$lblAlert.Location = New-Object System.Drawing.Point(12, 38)
+$lblAlert.Size = New-Object System.Drawing.Size(960, 24)
+$lblAlert.Anchor = 'Top,Left,Right'
+$lblAlert.AutoEllipsis = $true
+$lblAlert.TextAlign = 'MiddleLeft'
+$lblAlert.Padding = New-Object System.Windows.Forms.Padding(8, 0, 8, 0)
+$lblAlert.BackColor = [System.Drawing.Color]::FromArgb(90, 30, 32)
+$lblAlert.ForeColor = [System.Drawing.Color]::FromArgb(255, 200, 200)
+$lblAlert.Visible = $false
+$form.Controls.Add($lblAlert)
+$tipAlert = New-Object System.Windows.Forms.ToolTip
 
 $lv = New-Object System.Windows.Forms.ListView
 $lv.View = 'Details'
@@ -242,8 +302,8 @@ $lv.GridLines = $false
 $lv.BackColor = $panel
 $lv.ForeColor = $fg
 $lv.Font = $mono
-$lv.Location = New-Object System.Drawing.Point(12, 42)
-$lv.Size = New-Object System.Drawing.Size(960, 230)
+$lv.Location = New-Object System.Drawing.Point(12, 68)
+$lv.Size = New-Object System.Drawing.Size(960, 204)
 $lv.Anchor = 'Top,Left,Right'
 [void]$lv.Columns.Add('process', 300)
 [void]$lv.Columns.Add('count', 100)
@@ -367,9 +427,11 @@ function Update-View {
         # system alerts (handle leak, kernel pool, commit) at most once a minute, shown red in the stats line
         if (((Get-Date) - $script:AlertsAt).TotalSeconds -ge 60) { $script:Alerts = @(Get-SystemAlerts); $script:AlertsAt = Get-Date }
         if ($script:Alerts.Count -gt 0) {
-            $lblStats.Text += '   ALERT: ' + ($script:Alerts -join ' | ')
-            $lblStats.ForeColor = [System.Drawing.Color]::FromArgb(255, 120, 120)
-        } else { $lblStats.ForeColor = $fg }
+            $full = 'Warnung: ' + ($script:Alerts -join '  |  ')
+            $lblAlert.Text = $full
+            $tipAlert.SetToolTip($lblAlert, ($script:Alerts -join [Environment]::NewLine))
+            $lblAlert.Visible = $true
+        } else { $lblAlert.Visible = $false }
 
         $lv.BeginUpdate()
         $lv.Items.Clear()
